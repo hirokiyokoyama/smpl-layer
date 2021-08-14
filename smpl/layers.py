@@ -141,7 +141,7 @@ class SMPL(tf.keras.layers.Layer):
         # make transforms relative to original poses
         RJ = tf.matmul(
             R,
-            tf.concat([J, tf.zeros([24, 1], dtype=self.dtype)], axis=1)[:,:,tf.newaxis],
+            tf.concat([J, tf.zeros([self.n_joints, 1], dtype=self.dtype)], axis=1)[:,:,tf.newaxis],
         )
         R = R - tf.pad(RJ, [[0, 0], [0, 0], [3, 0]])
 
