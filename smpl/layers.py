@@ -20,45 +20,95 @@ def rodrigues(r):
     R = cos * i_cube + (1 - cos) * dot + tf.math.sin(theta) * m
     return R
 
+class NonNegUnitSum(tf.keras.constraints.Constraint):
+    def __init__(self, axis=-1):
+        super().__init__()
+        self.axis = axis
+
+    def __call__(self, w):
+        w = w * tf.cast(w >= 0., w.dtype)
+        w = w / tf.reduce_sum(w, axis=self.axis, keepdims=True)
+        return w
+
 class SMPL(tf.keras.layers.Layer):
     def __init__(self,
                  child2parent,
                  n_vertices = 6890,
                  n_betas = 10, 
                  simplify = False,
-                 dtype = tf.float32):
+                 dtype = tf.float32,
+                 use_v_template = True,
+                 v_template_initializer = 'random_normal',
+                 v_template_constraint = None,
+                 v_template_regularizer = None,
+                 use_J_regressor = True,
+                 J_regressor_initializer = 'random_normal',
+                 J_regressor_constraint = NonNegUnitSum(axis=1),
+                 J_regressor_regularizer = 'l1',
+                 use_weights = True,
+                 weights_initializer = 'random_normal',
+                 weights_constraint = NonNegUnitSum(axis=1),
+                 weights_regularizer = None,
+                 use_shapedirs = True,
+                 shapedirs_initializer = 'random_normal',
+                 shapedirs_constraint = None,
+                 shapedirs_regularizer = 'l2',
+                 use_posedirs = True,
+                 posedirs_initializer = 'random_normal',
+                 posedirs_constraint = None,
+                 posedirs_regularizer = 'l2'):
         super().__init__(dtype=dtype)
         self.child2parent = tf.constant(child2parent, tf.int32)
         n_joints = len(child2parent)
 
-        self.v_template = self.add_weight(
-            'v_template',
-            shape = [n_vertices, 3],
-            trainable = True)
-        self.J_regressor = self.add_weight(
-            'J_regressor',
-            shape = [n_joints, n_vertices],
-            trainable = True)
-        self.weights_ = self.add_weight(
-            'weights',
-            shape = [n_vertices, n_joints],
-            trainable = True)
-        self.shapedirs = self.add_weight(
-            'shapedirs',
-            shape = [n_vertices, 3, n_betas],
-            trainable = True)
-        if not simplify:
-            self.posedirs = self.add_weight(
-                'posedirs',
-                shape = [n_vertices, 3, (n_joints-1)*9],
+        if use_v_template:
+            self.v_template = self.add_weight(
+                'v_template',
+                shape = [n_vertices, 3],
+                initializer = v_template_initializer,
+                constraint = v_template_constraint,
+                regularizer = v_template_regularizer,
                 trainable = True)
+        if use_J_regressor:
+            self.J_regressor = self.add_weight(
+                'J_regressor',
+                shape = [n_joints, n_vertices],
+                initializer = J_regressor_initializer,
+                constraint = J_regressor_constraint,
+                regularizer = J_regressor_regularizer,
+                trainable = True)
+        if use_weights:
+            self.weights_ = self.add_weight(
+                'weights',
+                shape = [n_vertices, n_joints],
+                initializer = weights_initializer,
+                constraint = weights_constraint,
+                regularizer = weights_regularizer,
+                trainable = True)
+        if use_shapedirs:
+            self.shapedirs = self.add_weight(
+                'shapedirs',
+                shape = [n_vertices, 3, n_betas],
+                initializer = shapedirs_initializer,
+                constraint = shapedirs_constraint,
+                regularizer = shapedirs_regularizer,
+                trainable = True)
+        if not simplify:
+            if use_posedirs:
+                self.posedirs = self.add_weight(
+                    'posedirs',
+                    shape = [n_vertices, 3, (n_joints-1)*9],
+                    initializer = posedirs_initializer,
+                    constraint = posedirs_constraint,
+                    regularizer = posedirs_regularizer,
+                    trainable = True)
         self.n_vertices = n_vertices
         self.n_joints = n_joints
         self.n_betas = n_betas
         self.simplify = simplify
 
     @staticmethod
-    def load_from_pkl(file, dtype=None):
+    def from_pkl(file, dtype=None):
         import pickle
         import numpy as np
 
@@ -83,14 +133,12 @@ class SMPL(tf.keras.layers.Layer):
             n_vertices = n_vertices,
             n_betas = n_betas,
             simplify = simplify,
+            J_regressor_initializer = data['J_regressor'].todense(),
+            weights_initializer = data['weights'],
+            v_template_initializer = data['v_template'],
+            shapedirs_initializer = data['shapedirs'],
+            posedirs_initializer = data['posedirs'],
             dtype = dtype)
-        smpl.J_regressor.assign(data['J_regressor'].todense())
-        smpl.weights_.assign(data['weights'])
-        smpl.v_template.assign(data['v_template'])
-        smpl.shapedirs.assign(data['shapedirs'])
-        if not simplify:
-            smpl.posedirs.assign(data['posedirs'])
-
         smpl.faces = tf.constant(data['f'], tf.int32)
         return smpl
 
@@ -98,15 +146,18 @@ class SMPL(tf.keras.layers.Layer):
         return tf.matmul(self.J_regressor, vertices)
 
     def call(self, inputs):
-        betas, pose = inputs
-        return self.generate(betas, pose)
+        betas = inputs['beta']
+        pose = inputs['pose']
+        shapedirs = inputs.get('shapedirs') or self.shapedirs
+        v_template = inputs.get('v_template') or self.v_template
+        J_regressor = inputs.get('J_regressor') or self.J_regressor
+        weights_ = inputs.get('weights') or self.weights_
 
-    def generate(self, betas, pose):
         # add principal components to each template vertex
-        v_shaped = tf.tensordot(self.shapedirs, betas, axes=[[2], [0]]) + self.v_template
+        v_shaped = tf.tensordot(shapedirs, betas, axes=[[2], [0]]) + v_template
 
         # estimate joint positions
-        J = tf.matmul(self.J_regressor, v_shaped)
+        J = tf.matmul(J_regressor, v_shaped)
 
         # make batch of 3x3 rotation matrices
         pose_cube = tf.reshape(pose, [-1, 1, 3])
@@ -115,10 +166,12 @@ class SMPL(tf.keras.layers.Layer):
         if self.simplify:
             v_posed = v_shaped
         else:
+            posedirs = inputs.get('posedirs') or self.posedirs
+
             # posedirs represents distortion caused by joint rotation
             R_cube = R_cube_big[1:]
             lrotmin = tf.reshape(R_cube - tf.eye(3, dtype=self.dtype)[tf.newaxis], [-1])
-            v_posed = v_shaped + tf.tensordot(self.posedirs, lrotmin, axes=[[2], [0]])
+            v_posed = v_shaped + tf.tensordot(posedirs, lrotmin, axes=[[2], [0]])
 
         # affine transform (4x4) of root joint
         R = tf.concat([
@@ -146,7 +199,7 @@ class SMPL(tf.keras.layers.Layer):
         R = R - tf.pad(RJ, [[0, 0], [0, 0], [3, 0]])
 
         # distribute transforms from joints to vertices
-        T = tf.tensordot(self.weights_, R, axes=[[1], [0]])
+        T = tf.tensordot(weights_, R, axes=[[1], [0]])
 
         # apply the weighted transforms for each vertex
         rest_shape_h = tf.pad(v_posed, [[0, 0], [0, 1]], constant_values=1.)
