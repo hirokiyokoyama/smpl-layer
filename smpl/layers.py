@@ -1,4 +1,5 @@
 import tensorflow as tf
+from .constraints import NonNegUnitSum
 
 def rodrigues(r):
     # avoid division by zero
@@ -19,16 +20,6 @@ def rodrigues(r):
     dot = tf.matmul(A, B)
     R = cos * i_cube + (1 - cos) * dot + tf.math.sin(theta) * m
     return R
-
-class NonNegUnitSum(tf.keras.constraints.Constraint):
-    def __init__(self, axis=-1):
-        super().__init__()
-        self.axis = axis
-
-    def __call__(self, w):
-        w = w * tf.cast(w >= 0., w.dtype)
-        w = w / tf.reduce_sum(w, axis=self.axis, keepdims=True)
-        return w
 
 class SMPL(tf.keras.layers.Layer):
     def __init__(self,
@@ -61,6 +52,12 @@ class SMPL(tf.keras.layers.Layer):
         self.child2parent = tf.constant(child2parent, tf.int32)
         n_joints = len(child2parent)
 
+        self.v_template = None
+        self.J_regressor = None
+        self.weights_ = None
+        self.shapedirs = None
+        self.posedirs = None
+        
         if use_v_template:
             self.v_template = self.add_weight(
                 'v_template',
@@ -148,10 +145,10 @@ class SMPL(tf.keras.layers.Layer):
     def call(self, inputs):
         betas = inputs['beta']
         pose = inputs['pose']
-        shapedirs = inputs.get('shapedirs') or self.shapedirs
-        v_template = inputs.get('v_template') or self.v_template
-        J_regressor = inputs.get('J_regressor') or self.J_regressor
-        weights_ = inputs.get('weights') or self.weights_
+        shapedirs = inputs.get('shapedirs', self.shapedirs)
+        v_template = inputs.get('v_template', self.v_template)
+        J_regressor = inputs.get('J_regressor', self.J_regressor)
+        weights_ = inputs.get('weights', self.weights_)
 
         # add principal components to each template vertex
         v_shaped = tf.tensordot(shapedirs, betas, axes=[[2], [0]]) + v_template
@@ -166,7 +163,7 @@ class SMPL(tf.keras.layers.Layer):
         if self.simplify:
             v_posed = v_shaped
         else:
-            posedirs = inputs.get('posedirs') or self.posedirs
+            posedirs = inputs.get('posedirs', self.posedirs)
 
             # posedirs represents distortion caused by joint rotation
             R_cube = R_cube_big[1:]
