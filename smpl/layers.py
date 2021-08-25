@@ -69,7 +69,7 @@ class SMPL(tf.keras.layers.Layer):
         self.faces = tf.constant(faces, tf.int32)
         self.edges = unique_edges(self.faces)
         self.log_edge_lengths = tf.math.log(self.edge_length(self.v_template))
-        n_vertices = int(self.v_template.shape(0))
+        n_vertices = int(self.v_template.shape[0])
         n_joints = len(child2parent)
 
         self.J_regressor = None
