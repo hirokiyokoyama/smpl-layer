@@ -21,17 +21,31 @@ def rodrigues(r):
     R = cos * i_cube + (1 - cos) * dot + tf.math.sin(theta) * m
     return R
 
+def unique_edges(faces):
+    edges1 = tf.gather(faces, [0,1], axis=1)
+    edges2 = tf.gather(faces, [1,2], axis=1)
+    edges3 = tf.gather(faces, [2,0], axis=1)
+    edges = tf.concat([edges1, edges2, edges3], axis=0)
+    shift = tf.where(edges[:,0:1] > edges[:,1:2], [[0, 32]], [[32, 0]])
+    edges = tf.cast(edges, tf.int64)
+    shift = tf.cast(shift, tf.int64)
+    edges_packed = tf.bitwise.left_shift(edges, shift)
+    edges_packed = tf.unique(tf.reduce_sum(edges_packed, axis=1)).y
+
+    edges = tf.stack([
+        tf.bitwise.bitwise_and(edges_packed, 0xffffffff),
+        tf.bitwise.right_shift(edges_packed, 32)
+    ], axis=1)
+    return edges
+
 class SMPL(tf.keras.layers.Layer):
     def __init__(self,
+                 v_template,
+                 faces,
                  child2parent,
-                 n_vertices = 6890,
                  n_betas = 10, 
                  simplify = False,
                  dtype = tf.float32,
-                 use_v_template = True,
-                 v_template_initializer = 'random_normal',
-                 v_template_constraint = None,
-                 v_template_regularizer = None,
                  use_J_regressor = True,
                  J_regressor_initializer = 'random_normal',
                  J_regressor_constraint = NonNegUnitSum(axis=1),
@@ -47,25 +61,22 @@ class SMPL(tf.keras.layers.Layer):
                  use_posedirs = True,
                  posedirs_initializer = 'random_normal',
                  posedirs_constraint = None,
-                 posedirs_regularizer = 'l2'):
+                 posedirs_regularizer = 'l2',
+                 edge_elasticity_loss_weight = 1.0):
         super().__init__(dtype=dtype)
+        self.v_template = tf.constant(v_template, tf.float32)
         self.child2parent = tf.constant(child2parent, tf.int32)
+        self.faces = tf.constant(faces, tf.int32)
+        self.edges = unique_edges(self.faces)
+        self.log_edge_lengths = tf.math.log(self.edge_length(self.v_template))
+        n_vertices = int(self.v_template.shape(0))
         n_joints = len(child2parent)
 
-        self.v_template = None
         self.J_regressor = None
         self.weights_ = None
         self.shapedirs = None
         self.posedirs = None
         
-        if use_v_template:
-            self.v_template = self.add_weight(
-                'v_template',
-                shape = [n_vertices, 3],
-                initializer = v_template_initializer,
-                constraint = v_template_constraint,
-                regularizer = v_template_regularizer,
-                trainable = True)
         if use_J_regressor:
             self.J_regressor = self.add_weight(
                 'J_regressor',
@@ -103,6 +114,12 @@ class SMPL(tf.keras.layers.Layer):
         self.n_joints = n_joints
         self.n_betas = n_betas
         self.simplify = simplify
+        self.edge_elasticity_loss_weight = edge_elasticity_loss_weight
+
+    def edge_length(self, vertices):
+        edges = tf.gather(vertices, self.edges)
+        length = tf.linalg.norm(edges[:,0,:] - edges[:,1,:], axis=-1)
+        return length
 
     @staticmethod
     def from_pkl(file, dtype=None):
@@ -124,10 +141,10 @@ class SMPL(tf.keras.layers.Layer):
 
         kintree_table = tf.cast(data['kintree_table'], tf.int32)
         child2parent = tf.scatter_nd(kintree_table[1,:,tf.newaxis], kintree_table[0], [24])
+        faces = tf.cast(data['f'], tf.int32)
 
         smpl = SMPL(
-            child2parent,
-            n_vertices = n_vertices,
+            data['v_template'], faces, child2parent,
             n_betas = n_betas,
             simplify = simplify,
             J_regressor_initializer = data['J_regressor'].todense(),
@@ -145,8 +162,8 @@ class SMPL(tf.keras.layers.Layer):
     def call(self, inputs):
         betas = inputs['beta']
         pose = inputs['pose']
+        v_template = self.v_template
         shapedirs = inputs.get('shapedirs', self.shapedirs)
-        v_template = inputs.get('v_template', self.v_template)
         J_regressor = inputs.get('J_regressor', self.J_regressor)
         weights_ = inputs.get('weights', self.weights_)
 
@@ -202,4 +219,10 @@ class SMPL(tf.keras.layers.Layer):
         rest_shape_h = tf.pad(v_posed, [[0, 0], [0, 1]], constant_values=1.)
         v = tf.matmul(T, tf.reshape(rest_shape_h, [-1, 4, 1]))
         v = tf.reshape(v, [-1, 4])[:, :3]
+
+        # penalize expansion/contraction of edges
+        edge_lengths = tf.math.log(self.edge_length(v) + 1e-8)
+        edge_elast = tf.square(edge_lengths - self.log_edge_lengths)
+        edge_elast = tf.reduce_mean(edge_elast)
+        self.add_loss(edge_elast * self.edge_elasticity_loss_weight)
         return v
