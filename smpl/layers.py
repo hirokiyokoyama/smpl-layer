@@ -147,12 +147,11 @@ class SMPL(tf.keras.layers.Layer):
             data['v_template'], faces, child2parent,
             n_betas = n_betas,
             simplify = simplify,
-            J_regressor_initializer = data['J_regressor'].todense(),
-            weights_initializer = data['weights'],
-            v_template_initializer = data['v_template'],
-            shapedirs_initializer = data['shapedirs'],
-            posedirs_initializer = data['posedirs'],
             dtype = dtype)
+        smpl.J_regressor.assign(data['J_regressor'].todense())
+        smpl.weights_.assign(data['weights'])
+        smpl.shapedirs.assign(data['shapedirs'])
+        smpl.posedirs.assign(data['posedirs'])
         smpl.faces = tf.constant(data['f'], tf.int32)
         return smpl
 
