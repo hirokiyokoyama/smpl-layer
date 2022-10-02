@@ -117,8 +117,8 @@ class SMPL(tf.keras.layers.Layer):
         self.edge_elasticity_loss_weight = edge_elasticity_loss_weight
 
     def edge_length(self, vertices):
-        edges = tf.gather(vertices, self.edges)
-        length = tf.linalg.norm(edges[:,0,:] - edges[:,1,:], axis=-1)
+        edges = tf.gather(vertices, self.edges, axis=-2)
+        length = tf.linalg.norm(edges[...,0,:] - edges[...,1,:], axis=-1)
         return length
 
     @staticmethod
@@ -161,63 +161,86 @@ class SMPL(tf.keras.layers.Layer):
     def call(self, inputs):
         betas = inputs['beta']
         pose = inputs['pose']
+        N = tf.shape(betas)[0]
+
         v_template = self.v_template
         shapedirs = inputs.get('shapedirs', self.shapedirs)
         J_regressor = inputs.get('J_regressor', self.J_regressor)
         weights_ = inputs.get('weights', self.weights_)
 
         # add principal components to each template vertex
-        v_shaped = tf.tensordot(shapedirs, betas, axes=[[2], [0]]) + v_template
+        #v_shaped = tf.tensordot(shapedirs, betas, axes=[[2], [1]]) + v_template
+        # [N,B] [V,3,B] -> [N,V,3]
+        v_shaped = tf.tensordot(betas, shapedirs, axes=[[-1], [-1]]) + v_template
 
         # estimate joint positions
-        J = tf.matmul(J_regressor, v_shaped)
+        # [1,J,V] [N,V,3] -> [N,J,3]
+        J = tf.matmul(J_regressor[tf.newaxis], v_shaped)
 
         # make batch of 3x3 rotation matrices
         pose_cube = tf.reshape(pose, [-1, 1, 3])
         R_cube_big = rodrigues(pose_cube)
+        R_cube_big = tf.reshape(R_cube_big, [-1, 24, 3, 3])
 
         if self.simplify:
             v_posed = v_shaped
         else:
+            # [V,3,(J-1)*9]
             posedirs = inputs.get('posedirs', self.posedirs)
 
             # posedirs represents distortion caused by joint rotation
-            R_cube = R_cube_big[1:]
-            lrotmin = tf.reshape(R_cube - tf.eye(3, dtype=self.dtype)[tf.newaxis], [-1])
-            v_posed = v_shaped + tf.tensordot(posedirs, lrotmin, axes=[[2], [0]])
+            R_cube = R_cube_big[:,1:]
+            lrotmin = tf.reshape(R_cube - tf.eye(3, dtype=self.dtype)[tf.newaxis,tf.newaxis], [-1,23*9])
+            #v_posed = v_shaped + tf.tensordot(posedirs, lrotmin, axes=[[2], [0]])
+            # [N,(J-1)*9] [V,3,(J-1)*9] -> [N,V,3]
+            v_posed = v_shaped + tf.tensordot(lrotmin, posedirs, axes=[[-1], [-1]])
 
         # affine transform (4x4) of root joint
+        # [N,3,3] [N,3,1] -> [N,3,4]
+        # [N,3,4] [N,1,4] -> [N,4,4]
+        bottom_row = tf.tile([[[0., 0., 0., 1.]]], [N,1,1])
         R = tf.concat([
-            tf.concat([R_cube_big[0], J[0, :, tf.newaxis]], axis=1),
-            [[0., 0., 0., 1.]]], axis=0)
-        R = R[tf.newaxis]
+            tf.concat([R_cube_big[:,0], J[:,0,:,tf.newaxis]], axis=-1),
+            bottom_row], axis=-2)
+        R = R[:,tf.newaxis]
         
         # stack affine transforms (Nx4x4) from global origin to joints
         for i in range(1, self.n_joints):
             j = self.child2parent[i]
             # affine transform (4x4) of joint i
+            # [N,4,4] [N,4,4] -> [N,4,4]
             _R = tf.matmul(
-                R[j],
+                R[:,j],
                 tf.concat([
-                    tf.concat([R_cube_big[i], (J[i, :] - J[j, :])[:, tf.newaxis]], axis=1),
-                    [[0., 0., 0., 1.]]], axis=0)
+                    # [N,3,4] [N,1,4] -> [N,4,4]
+                    tf.concat([
+                        # [N,3,3] [N,3,1] -> [N,3,4]
+                        R_cube_big[:,i], (J[:,i,:] - J[:,j,:])[...,tf.newaxis]], axis=-1),
+                    bottom_row], axis=-2)
             )
-            R = tf.concat([R, _R[tf.newaxis]], axis=0)
+            # [N,J,3,3]
+            R = tf.concat([R, _R[:,tf.newaxis]], axis=1)
 
         # make transforms relative to original poses
+        # [N,J,4,4] [N,J,4,1] -> [N,J,4,1]
         RJ = tf.matmul(
             R,
-            tf.concat([J, tf.zeros([self.n_joints, 1], dtype=self.dtype)], axis=1)[:,:,tf.newaxis],
+            #tf.concat([J, tf.zeros([self.n_joints, 1], dtype=self.dtype)], axis=1)[:,:,tf.newaxis],
+            tf.pad(J, [[0,0],[0,0],[0,1]])[...,tf.newaxis]
         )
-        R = R - tf.pad(RJ, [[0, 0], [0, 0], [3, 0]])
+        R = R - tf.pad(RJ, [[0,0], [0, 0], [0, 0], [3, 0]])
 
         # distribute transforms from joints to vertices
-        T = tf.tensordot(weights_, R, axes=[[1], [0]])
+        #T = tf.tensordot(weights_, R, axes=[[1], [0]])
+        #  [N,J,4,4] [V,J] -> [N,V,4,4]
+        T = tf.einsum('njab,vj->nvab', R, weights_)
 
         # apply the weighted transforms for each vertex
-        rest_shape_h = tf.pad(v_posed, [[0, 0], [0, 1]], constant_values=1.)
-        v = tf.matmul(T, tf.reshape(rest_shape_h, [-1, 4, 1]))
-        v = tf.reshape(v, [-1, 4])[:, :3]
+        rest_shape_h = tf.pad(v_posed, [[0,0], [0,0], [0,1]], constant_values=1.)
+        # [N,V,4,4] [N,V,4,1] -> [N,V,4,1]
+        v = tf.matmul(T, rest_shape_h[...,tf.newaxis])
+        # [N,V,3]
+        v = v[...,:3,0]
 
         # penalize expansion/contraction of edges
         edge_lengths = tf.math.log(self.edge_length(v) + 1e-8)
